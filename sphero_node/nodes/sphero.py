@@ -34,8 +34,9 @@
 import rospy
 
 import math
+import numpy as np
 import sys
-import tf
+import tf, tf2_ros
 import PyKDL
 
 from sphero_driver import sphero_driver
@@ -43,7 +44,7 @@ import dynamic_reconfigure.server
 
 from sensor_msgs.msg import Imu
 from nav_msgs.msg import Odometry
-from geometry_msgs.msg import Point, Pose, Quaternion, Twist, TwistWithCovariance, Vector3
+from geometry_msgs.msg import Point, Pose, Quaternion, Twist, TwistWithCovariance, Vector3, TransformStamped
 from sphero_node.msg import SpheroCollision
 from std_msgs.msg import ColorRGBA, Float32, Bool
 from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
@@ -76,11 +77,11 @@ class SpheroNode(object):
         rospy.init_node('sphero')
         self.update_rate = default_update_rate
         self.sampling_divisor = int(400/self.update_rate)
-
         self.is_connected = False
         self._init_pubsub()
         self._init_params()
-        self.robot = sphero_driver.Sphero()
+        self._sleep_on_disconnect = rospy.get_param('~sleep_on_disconnect', False)
+        self.robot = sphero_driver.Sphero(target_addr=rospy.get_param('~target_addr', None))
         self.imu = Imu()
         self.imu.orientation_covariance = [1e-6, 0, 0, 0, 1e-6, 0, 0, 0, 1e-6]
         self.imu.angular_velocity_covariance = [1e-6, 0, 0, 0, 1e-6, 0, 0, 0, 1e-6]
@@ -92,19 +93,36 @@ class SpheroNode(object):
         self.power_state_msg = "No Battery Info"
         self.power_state = 0
 
+        self._shell_tf = TransformStamped()
+        self._shell_tf.header.frame_id = "base_link"
+        self._shell_tf.child_frame_id = "shell"
+        self._shell_tf.transform.translation.x = 0.00
+        self._shell_tf.transform.translation.y = 0.00
+        self._shell_tf.transform.translation.z = 0.00
+        q = tf.transformations.quaternion_from_euler(-1.57, 0.00, 1.57)
+        self._shell_tf.transform.rotation.x = q[0]
+        self._shell_tf.transform.rotation.y = q[1]
+        self._shell_tf.transform.rotation.z = q[2]
+        self._shell_tf.transform.rotation.w = q[3]
+
+        self._odom_prev = Odometry(header=rospy.Header(frame_id="odom"), child_frame_id='base_footprint')
+
+
     def _init_pubsub(self):
-        self.odom_pub = rospy.Publisher('odom', Odometry)
-        self.imu_pub = rospy.Publisher('imu', Imu)
-        self.collision_pub = rospy.Publisher('collision', SpheroCollision)
-        self.diag_pub = rospy.Publisher('/diagnostics', DiagnosticArray)
+        self.odom_pub = rospy.Publisher('odom', Odometry, queue_size = 1)
+        self.imu_pub = rospy.Publisher('imu', Imu, queue_size = 1)
+        self.collision_pub = rospy.Publisher('collision', SpheroCollision, queue_size = 1)
+        self.diag_pub = rospy.Publisher('/diagnostics', DiagnosticArray, queue_size = 1)
         self.cmd_vel_sub = rospy.Subscriber('cmd_vel', Twist, self.cmd_vel, queue_size = 1)
         self.color_sub = rospy.Subscriber('set_color', ColorRGBA, self.set_color, queue_size = 1)
         self.back_led_sub = rospy.Subscriber('set_back_led', Float32, self.set_back_led, queue_size = 1)
         self.stabilization_sub = rospy.Subscriber('disable_stabilization', Bool, self.set_stabilization, queue_size = 1)
         self.heading_sub = rospy.Subscriber('set_heading', Float32, self.set_heading, queue_size = 1)
+        self.sleep_sub = rospy.Subscriber('sleep', Bool, self.sleep, queue_size = 1)
         self.angular_velocity_sub = rospy.Subscriber('set_angular_velocity', Float32, self.set_angular_velocity, queue_size = 1)
         self.reconfigure_srv = dynamic_reconfigure.server.Server(ReconfigConfig, self.reconfigure)
-        self.transform_broadcaster = tf.TransformBroadcaster()
+        self.transform_broadcaster = tf2_ros.TransformBroadcaster()
+        # self.transform_listener = tf2_ros.TransformListener()
 
     def _init_params(self):
         self.connect_color_red = rospy.get_param('~connect_red',0)
@@ -150,6 +168,10 @@ class SpheroNode(object):
                 self.last_diagnostics_time = now
                 self.publish_diagnostics(now)
             r.sleep()
+        
+        #sleep when rospy is shutdown
+        if self._sleep_on_disconnect:
+            self.robot.go_to_sleep(0,0,0)
                     
     def stop(self):    
         #tell the ball to stop moving before quiting
@@ -201,10 +223,10 @@ class SpheroNode(object):
             now = rospy.Time.now()
             imu = Imu(header=rospy.Header(frame_id="imu_link"))
             imu.header.stamp = now
-            imu.orientation.x = data["QUATERNION_Q0"]
-            imu.orientation.y = data["QUATERNION_Q1"]
-            imu.orientation.z = data["QUATERNION_Q2"]
-            imu.orientation.w = data["QUATERNION_Q3"]
+            imu.orientation.x = -data["QUATERNION_Q2"]/10000.0
+            imu.orientation.y =  data["QUATERNION_Q1"]/10000.0
+            imu.orientation.z = -data["QUATERNION_Q3"]/10000.0
+            imu.orientation.w = data["QUATERNION_Q0"]/10000.0
             imu.linear_acceleration.x = data["ACCEL_X_FILTERED"]/4096.0*9.8
             imu.linear_acceleration.y = data["ACCEL_Y_FILTERED"]/4096.0*9.8
             imu.linear_acceleration.z = data["ACCEL_Z_FILTERED"]/4096.0*9.8
@@ -215,18 +237,66 @@ class SpheroNode(object):
             self.imu = imu
             self.imu_pub.publish(self.imu)
 
+            # print imu.orientation
             odom = Odometry(header=rospy.Header(frame_id="odom"), child_frame_id='base_footprint')
             odom.header.stamp = now
-            odom.pose.pose = Pose(Point(data["ODOM_X"]/100.0,data["ODOM_Y"]/100.0,0.0), Quaternion(0.0,0.0,0.0,1.0))
+            odom.pose.pose = Pose(Point( -data["ODOM_Y"]/100.0, data["ODOM_X"]/100.0,0.0), 
+                Quaternion(0.0,0.0,0.0,1.0))
+                # Quaternion(imu.orientation.x, imu.orientation.y, imu.orientation.z, imu.orientation.w))
             odom.twist.twist = Twist(Vector3(data["VELOCITY_X"]/1000.0, 0, 0), Vector3(0, 0, data["GYRO_Z_FILTERED"]*10.0*math.pi/180.0))
             odom.pose.covariance =self.ODOM_POSE_COVARIANCE                
             odom.twist.covariance =self.ODOM_TWIST_COVARIANCE
             self.odom_pub.publish(odom)                      
 
             #need to publish this trasform to show the roll, pitch, and yaw properly
-            self.transform_broadcaster.sendTransform((0.0, 0.0, 0.038 ),
-                (data["QUATERNION_Q0"], data["QUATERNION_Q1"], data["QUATERNION_Q2"], data["QUATERNION_Q3"]),
-                odom.header.stamp, "base_link", "base_footprint")
+            t = TransformStamped()
+            t.header.stamp = rospy.Time.now()
+            t.header.frame_id = "base_footprint"
+            t.child_frame_id = "base_link"
+            t.transform.translation.x = 0.00
+            t.transform.translation.y = 0.00
+            t.transform.translation.z = 0.038
+            t.transform.rotation = imu.orientation
+            self.transform_broadcaster.sendTransform(t)
+
+            #shell transform
+            radius = 0.0381
+            diff_x = odom.pose.pose.position.x - self._odom_prev.pose.pose.position.x
+            diff_y = odom.pose.pose.position.y - self._odom_prev.pose.pose.position.y
+            # print odom.pose.pose.position.x, odom.pose.pose.position.y, diff_x, diff_y
+            diff = math.sqrt(diff_x**2+diff_y**2)
+            q_prev = np.array([
+                self._shell_tf.transform.rotation.x,
+                self._shell_tf.transform.rotation.y,
+                self._shell_tf.transform.rotation.z,
+                self._shell_tf.transform.rotation.w])
+            #todo handle backward rotation
+            q_imu = np.array([
+                t.transform.rotation.x,
+                t.transform.rotation.y,
+                t.transform.rotation.z,
+                t.transform.rotation.w])
+            e_imu = np.array([
+                t.transform.rotation.x,
+                t.transform.rotation.y,
+                t.transform.rotation.z])
+
+            e = tf.transformations.quaternion_matrix(q_imu)
+            e_x = np.array([e[0][0], e[1][0], e[2][0]])
+            direction = 1            
+            if np.dot(e_x, np.array([diff_x, diff_y, 0.0])) < 0:
+                direction = -1
+            q_diff = tf.transformations.quaternion_about_axis(diff/radius, (0.0, direction ,0.0))
+            q_new  = tf.transformations.quaternion_multiply(q_diff, q_prev)
+            self._shell_tf.transform.rotation.x = q_new[0]
+            self._shell_tf.transform.rotation.y = q_new[1]
+            self._shell_tf.transform.rotation.z = q_new[2]
+            self._shell_tf.transform.rotation.w = q_new[3]
+
+            self._shell_tf.header.stamp = rospy.Time.now()
+            self.transform_broadcaster.sendTransform(self._shell_tf)
+
+            self._odom_prev = odom
 
     def cmd_vel(self, msg):
         if self.is_connected:
@@ -242,6 +312,10 @@ class SpheroNode(object):
     def set_back_led(self, msg):
         if self.is_connected:
             self.robot.set_back(msg.data, False)
+
+    def sleep(self,msg):
+        if self.is_connected:
+            self.robot.go_to_sleep(0,0,0)
 
     def set_stabilization(self, msg):
         if self.is_connected:
